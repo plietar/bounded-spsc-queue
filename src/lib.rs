@@ -44,7 +44,8 @@ pub struct Buffer<T> {
     /// The allocated size of the ring buffer, in terms of number of values (not physical memory).
     /// This will be the next power of two larger than `capacity`
     allocated_size: usize,
-    _padding1:      [u64;cacheline_pad!(3)],
+    clear:          AtomicUsize,
+    _padding1:      [u64;cacheline_pad!(2)],
 
     /// Consumer cacheline:
 
@@ -79,6 +80,59 @@ unsafe impl<T: Send> Send for Producer<T> { }
 impl<T> !Sync for Consumer<T> {}
 impl<T> !Sync for Producer<T> {}
 
+impl<T: Copy> Buffer<T> {
+    pub fn try_read(&self, data: &mut [T]) -> usize {
+        let current_head = self.check_clear();
+        let current_tail = self.tail.load(Ordering::Acquire);
+
+        let count = ::std::cmp::min(current_tail - current_head, data.len());
+        for i in 0..count {
+            data[i] = unsafe { ptr::read(self.load(current_head + i)) };
+        }
+
+        self.head.store(current_head.wrapping_add(count), Ordering::Release);
+
+        count
+    }
+
+    pub fn try_write(&self, data: &[T]) -> usize {
+        let current_head = self.head.load(Ordering::Relaxed);
+        let current_tail = self.tail.load(Ordering::Acquire);
+
+        let count = ::std::cmp::min(self.capacity - (current_tail - current_head), data.len());
+        for i in 0..count {
+            unsafe { self.store(current_tail + i, data[i]) };
+        }
+
+        self.tail.store(current_tail.wrapping_add(count), Ordering::Release);
+
+        count
+    }
+}
+
+impl <T> Buffer<T> {
+    pub fn check_clear(&self) -> usize {
+        let clear = self.clear.swap(0, Ordering::Relaxed);
+        if clear > 0 {
+            self.head.store(clear, Ordering::Relaxed);
+            clear
+        } else {
+            self.head.load(Ordering::Relaxed)
+        }
+    }
+
+    pub fn request_clear(&self) {
+        let current_tail = self.tail.load(Ordering::Relaxed);
+        self.clear.store(current_tail, Ordering::Relaxed);
+    }
+}
+
+impl <T> Producer<T> {
+    pub fn clear(&self) {
+        (*self.buffer).request_clear();
+    }
+}
+
 impl<T> Buffer<T> {
 
     /// Attempt to pop a value off the buffer.
@@ -98,7 +152,7 @@ impl<T> Buffer<T> {
     /// }
     /// ```
     pub fn try_pop(&self) -> Option<T> {
-        let current_head = self.head.load(Ordering::Relaxed);
+        let current_head = self.check_clear();
 
         if current_head == self.shadow_tail.get() {
             self.shadow_tail.set(self.tail.load(Ordering::Acquire));
@@ -300,7 +354,8 @@ pub fn make<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
         buffer: ptr,
         capacity: capacity,
         allocated_size: capacity.next_power_of_two(),
-        _padding1:      [0; cacheline_pad!(3)],
+        clear:          AtomicUsize::new(0),
+        _padding1:      [0; cacheline_pad!(2)],
 
         head:           AtomicUsize::new(0),
         shadow_tail:    Cell::new(0),
@@ -421,6 +476,18 @@ impl<T> Producer<T> {
         self.capacity() - self.size()
     }
 
+}
+
+impl<T: Copy> Consumer<T> {
+    pub fn try_read(&self, data: &mut [T]) -> usize {
+        (*self.buffer).try_read(data)
+    }
+}
+
+impl<T: Copy> Producer<T> {
+    pub fn try_write(&self, data: &[T]) -> usize {
+        (*self.buffer).try_write(data)
+    }
 }
 
 impl<T> Consumer<T> {
